@@ -74,6 +74,7 @@ use nice_plug_core::context::process::Transport;
 use nice_plug_core::editor::{Editor, SpawnedEditor};
 use nice_plug_core::midi::{Channel, Key, MidiConfig, NoteEvent, PluginNoteEvent, VoiceID};
 use nice_plug_core::params::internals::ParamPtr;
+use nice_plug_core::params::range::FloatRange;
 use nice_plug_core::params::{ParamFlags, Params};
 use nice_plug_core::plugin::{Plugin, PluginState, ProcessStatus, TaskExecutor};
 #[cfg(feature = "editor")]
@@ -911,8 +912,8 @@ impl<P: ClapPlugin> Wrapper<P> {
                             return false;
                         }
 
-                        let normalized_value = clap_plain_value as f32
-                            / unsafe { param_ptr.step_count() }.unwrap_or(1) as f32;
+                        let normalized_value =
+                            clap_plain_value as f32 / unsafe { clap_scale(param_ptr) } as f32;
 
                         if unsafe { param_ptr._internal_set_normalized_value(normalized_value) } {
                             if let Some(sample_rate) = sample_rate {
@@ -941,8 +942,8 @@ impl<P: ClapPlugin> Wrapper<P> {
                             return false;
                         }
 
-                        let normalized_delta = clap_plain_delta as f32
-                            / unsafe { param_ptr.step_count() }.unwrap_or(1) as f32;
+                        let normalized_delta =
+                            clap_plain_delta as f32 / unsafe { clap_scale(param_ptr) } as f32;
 
                         if unsafe { param_ptr._internal_modulate_value(normalized_delta) } {
                             if let Some(sample_rate) = sample_rate {
@@ -1227,7 +1228,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                     // integer or enum parameters
                     let param_ptr = self.param_by_hash[&event.param_id];
                     let normalized_value =
-                        event.value as f32 / unsafe { param_ptr.step_count().unwrap_or(1) as f32 };
+                        event.value as f32 / unsafe { clap_scale(&param_ptr) as f32 };
 
                     push_event(
                         input_events,
@@ -1249,7 +1250,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                             // integer or enum parameters
                             let param_ptr = self.param_by_hash[&event.param_id];
                             let normalized_offset = event.amount as f32
-                                / unsafe { param_ptr.step_count().unwrap_or(1) as f32 };
+                                / unsafe { clap_scale(&param_ptr) as f32 };
 
                             // The host may also add key and channel information here, but it may
                             // also pass -1. So not having that information here at all seems like
@@ -3169,6 +3170,8 @@ impl<P: ClapPlugin> Wrapper<P> {
         let param_ptr = &wrapper.param_by_hash[param_hash];
         let default_value = unsafe { param_ptr.default_normalized_value() };
         let step_count = unsafe { param_ptr.step_count() };
+        // OpenRB-338 patch (task-275): the CLAP range is `0..=scale` ([`clap_scale`])
+        let scale = unsafe { clap_scale(param_ptr) };
         let flags = unsafe { param_ptr.flags() };
         let automatable = !flags.contains(ParamFlags::NON_AUTOMATABLE);
         let hidden = flags.contains(ParamFlags::HIDDEN);
@@ -3209,8 +3212,8 @@ impl<P: ClapPlugin> Wrapper<P> {
         // Stepped parameters are unnormalized float parameters since there's no separate step
         // range option
         // TODO: This should probably be encapsulated in some way so we don't forget about this in one place
-        param_info.max_value = step_count.unwrap_or(1) as f64;
-        param_info.default_value = default_value as f64 * step_count.unwrap_or(1) as f64;
+        param_info.max_value = scale as f64;
+        param_info.default_value = default_value as f64 * scale as f64;
 
         true
     }
@@ -3227,7 +3230,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             Some(param_ptr) => {
                 unsafe {
                     *value = param_ptr.modulated_normalized_value() as f64
-                        * param_ptr.step_count().unwrap_or(1) as f64;
+                        * clap_scale(param_ptr) as f64;
                 }
 
                 true
@@ -3255,7 +3258,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                         dest,
                         // CLAP does not have a separate unit, so we'll include the unit here
                         &param_ptr.normalized_value_to_string(
-                            value as f32 / param_ptr.step_count().unwrap_or(1) as f32,
+                            value as f32 / clap_scale(param_ptr) as f32,
                             true,
                         ),
                     );
@@ -3295,7 +3298,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                         None => return false,
                     };
                 unsafe {
-                    *value = normalized_value * param_ptr.step_count().unwrap_or(1) as f64;
+                    *value = normalized_value * clap_scale(param_ptr) as f64;
                 }
 
                 true
@@ -3528,6 +3531,33 @@ impl<P: ClapPlugin> Wrapper<P> {
             None => false,
         }
     }
+}
+
+/// OpenRB-338 patch (task-275): the factor between a parameter's normalized value and its CLAP
+/// value, used everywhere upstream used `step_count().unwrap_or(1)`. A stepped parameter's is
+/// its step count, as upstream. A `FloatParam` over a linear range `0..=max`, with `max` a
+/// whole number of at least 1, has `max` (upstream: 1): its CLAP value is its plain value, as
+/// it was when the same parameter was an `IntParam` over `0..=max`, so a host's saved CLAP
+/// values and automation (REAPER stores the CLAP value) keep their meaning, while the
+/// parameter is no longer stepped (`CLAP_PARAM_IS_STEPPED` still follows `step_count`).
+/// Every other parameter has 1, as upstream.
+///
+/// # Safety
+///
+/// `param_ptr` must point to a live parameter.
+pub(crate) unsafe fn clap_scale(param_ptr: &ParamPtr) -> usize {
+    if let Some(n) = unsafe { param_ptr.step_count() } {
+        return n;
+    }
+    if let ParamPtr::FloatParam(p) = param_ptr
+        && let FloatRange::Linear { min, max } = unsafe { (**p).range() }
+        && min == 0.0
+        && max >= 1.0
+        && max.fract() == 0.0
+    {
+        return max as usize;
+    }
+    1
 }
 
 /// Convenience function to query an extension from the host.

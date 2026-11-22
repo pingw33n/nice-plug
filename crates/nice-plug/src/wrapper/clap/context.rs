@@ -572,7 +572,9 @@ impl<P: ClapPlugin> nice_plug_core::context::gui::GuiContextInner for WrapperGui
                 // be changed when the output event is written to prevent changing parameter values
                 // in the middle of processing audio.
                 let clap_plain_value =
-                    normalized as f64 * unsafe { param.step_count().unwrap_or(1) as f64 };
+                    // OpenRB-338 patch (task-275): the CLAP value's factor
+                    normalized as f64
+                        * unsafe { crate::wrapper::clap::wrapper::clap_scale(&param) as f64 };
                 let success = wrapper.queue_parameter_event(OutputParamEvent::SetValue {
                     param_hash: *hash,
                     clap_plain_value,
